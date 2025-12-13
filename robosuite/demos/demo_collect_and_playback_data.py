@@ -35,7 +35,7 @@ import numpy as np
 import robosuite as suite
 from robosuite import load_composite_controller_config
 from robosuite.controllers.composite.composite_controller import WholeBody
-from robosuite.wrappers import VisualizationWrapper
+from robosuite.wrappers import VisualizationWrapper, DomainRandomizationWrapper
 
 
 class HDF5DataCollectionWrapper:
@@ -57,21 +57,29 @@ class HDF5DataCollectionWrapper:
         self.directory = directory
         self.collect_freq = collect_freq
         self.flush_freq = flush_freq
+        
+        # Randomization info
+        self.randomization_enabled = False
+        self.randomization_seed = None
 
         # Create directory if it doesn't exist
-        if not os.path.exists(directory):
-            print(f"HDF5DataCollectionWrapper: making new directory at {directory}")
-            os.makedirs(directory)
+        if not os.path.exists(self.directory):
+            print(f"HDF5DataCollectionWrapper: making new directory at {self.directory}")
+            os.makedirs(self.directory)
 
         # Episode tracking
         self.episode_count = 0
         self.current_episode_data = None
         self.episode_start_time = None
         self.episode_success = False
-        self.episode_success = False
 
         # Current episode data buffers
         self.reset_episode_data()
+
+    def set_randomization_info(self, enabled, seed):
+        """Set randomization information to be saved with the episode."""
+        self.randomization_enabled = enabled
+        self.randomization_seed = seed
 
     def reset_episode_data(self):
         """Reset data buffers for new episode."""
@@ -200,6 +208,11 @@ class HDF5DataCollectionWrapper:
             f.attrs['start_time'] = self.episode_start_time
             f.attrs['duration'] = time.time() - self.episode_start_time
             f.attrs['success'] = self.episode_success
+            
+            # Save randomization info
+            f.attrs['randomization_enabled'] = self.randomization_enabled
+            if self.randomization_seed is not None:
+                f.attrs['randomization_seed'] = self.randomization_seed
 
             # Save model XML and initial state for playback
             f.create_dataset('model_xml', data=self._current_task_instance_xml, dtype=h5py.string_dtype())
@@ -221,7 +234,8 @@ class HDF5DataCollectionWrapper:
                 f.create_dataset(key, data=value)
 
             # Save basic trajectory data
-            f.create_dataset('actions', data=np.array(self.current_episode_data['actions']))
+            # Use float64 for actions to minimize precision loss during playback
+            f.create_dataset('actions', data=np.array(self.current_episode_data['actions']), dtype='f8')
             f.create_dataset('rewards', data=np.array(self.current_episode_data['rewards']))
             f.create_dataset('dones', data=np.array(self.current_episode_data['dones']))
             f.create_dataset('timestamps', data=np.array(self.current_episode_data['timestamps']))
@@ -263,7 +277,7 @@ class HDF5DataCollectionWrapper:
         print(f"Episode {self.episode_count} saved with {len(self.current_episode_data['actions'])} steps [{success_marker}]")
 
 
-def collect_teleoperation_trajectory(env, device, data_collector, max_fr=None):
+def collect_teleoperation_trajectory(env, device, data_collector, max_fr=None, randomize=False, randomize_seed=None):
     """Collect trajectory data through keyboard teleoperation.
 
     Args:
@@ -271,7 +285,56 @@ def collect_teleoperation_trajectory(env, device, data_collector, max_fr=None):
         device: keyboard/spacemouse device for teleoperation
         data_collector: HDF5DataCollectionWrapper instance
         max_fr (int): if specified, pause the simulation whenever simulation runs faster than max_fr
+        randomize (bool): whether to apply domain randomization
+        randomize_seed (int): seed for domain randomization
     """
+    
+    # Apply domain randomization if requested
+    if randomize:
+        # Get all geom names
+        all_geoms = env.sim.model.geom_names
+        # Identify robot prefixes
+        robot_prefixes = [robot.robot_model.naming_prefix for robot in env.robots]
+        # Filter out robot geoms
+        non_robot_geoms = [name for name in all_geoms if not any(name.startswith(prefix) for prefix in robot_prefixes)]
+        
+        # Use provided seed or generate random one
+        if randomize_seed is None:
+            randomize_seed = np.random.randint(0, 100000)
+            
+        print(f"Applying domain randomization with seed {randomize_seed}...")
+        env = DomainRandomizationWrapper(
+            env,
+            seed=randomize_seed,
+            randomize_color=True,
+            randomize_camera=True,
+            randomize_lighting=True,
+            randomize_dynamics=False,
+            color_randomization_args={
+                'geom_names': non_robot_geoms, 
+                'randomize_local': False, 
+                'randomize_material': True
+            },
+            camera_randomization_args={
+                'randomize_position': True, 
+                'randomize_rotation': True, 
+                'randomize_fovy': True
+            },
+            lighting_randomization_args={
+                'randomize_position': True, 
+                'randomize_direction': True, 
+                'randomize_specular': True, 
+                'randomize_ambient': True, 
+                'randomize_diffuse': True
+            },
+            randomize_on_reset=True,
+            randomize_every_n_steps=0
+        )
+        
+        # Update data collector with randomization info
+        data_collector.set_randomization_info(True, randomize_seed)
+        # Update data collector's env reference since we wrapped it
+        data_collector.env = env
 
     # Reset the environment
     obs = env.reset()
@@ -377,13 +440,16 @@ def collect_teleoperation_trajectory(env, device, data_collector, max_fr=None):
     print(f"Episode completed with {step_count} steps")
 
 
-def playback_trajectory(env, hdf5_file, max_fr=None):
+def playback_trajectory(env, hdf5_file, max_fr=None, randomize=False, randomize_seed=None, record_dir=None):
     """Playback data from an HDF5 episode file with complete state restoration.
 
     Args:
         env (MujocoEnv): environment instance to playback trajectory in
         hdf5_file (str): Path to the HDF5 file containing episode data
         max_fr (int): if specified, pause the simulation whenever simulation runs faster than max_fr
+        randomize (bool): whether to apply domain randomization during playback
+        randomize_seed (int): seed for domain randomization
+        record_dir (str): if specified, record the playback to this directory
     """
 
     print(f"Loading episode from {hdf5_file}")
@@ -393,12 +459,97 @@ def playback_trajectory(env, hdf5_file, max_fr=None):
         rewards = f['rewards'][:]
         dones = f['dones'][:]
         timestamps = f['timestamps'][:]
+        
+        # Check for recorded randomization
+        recorded_randomize = f.attrs.get('randomization_enabled', False)
+        recorded_seed = f.attrs.get('randomization_seed', None)
 
         print(f"Episode has {len(actions)} steps")
         print(f"Duration: {f.attrs.get('duration', 'N/A'):.2f} seconds")
         print(f"Environment: {f.attrs.get('environment', 'N/A')}")
         print(f"Robots: {f.attrs.get('robots', 'N/A')}")
         print(f"Success: {f.attrs.get('success', 'N/A')}")
+        print(f"Recorded Randomization: {recorded_randomize} (Seed: {recorded_seed})")
+
+        # Determine randomization strategy
+        use_randomization = False
+        seed_to_use = None
+        
+        if randomize:
+            # User explicitly requested randomization (Data Augmentation)
+            use_randomization = True
+            seed_to_use = randomize_seed if randomize_seed is not None else np.random.randint(0, 100000)
+            print(f"Applying NEW randomization (Data Augmentation) with seed {seed_to_use}")
+        elif recorded_randomize:
+            # Reproduce recorded randomization
+            use_randomization = True
+            seed_to_use = recorded_seed
+            print(f"Reproducing RECORDED randomization with seed {seed_to_use}")
+            
+        # Apply randomization wrapper if needed
+        if use_randomization:
+            # Get all geom names
+            all_geoms = env.sim.model.geom_names
+            # Identify robot prefixes
+            robot_prefixes = [robot.robot_model.naming_prefix for robot in env.robots]
+            # Filter out robot geoms
+            non_robot_geoms = [name for name in all_geoms if not any(name.startswith(prefix) for prefix in robot_prefixes)]
+            # Also filter out gripper geoms (usually start with gripper prefix but not robot prefix)
+            non_robot_geoms = [name for name in non_robot_geoms if "gripper" not in name]
+            
+            # Split into background and objects
+            background_keywords = ['floor', 'wall']
+            background_geoms = [name for name in non_robot_geoms if any(k in name for k in background_keywords)]
+            
+            # Objects: only cubes and cones (exclude tables, robot base, etc.)
+            object_keywords = ['cube', 'cone']
+            object_geoms = [name for name in non_robot_geoms if any(k in name for k in object_keywords)]
+            
+            print(f"Randomizing {len(background_geoms)} background geoms (walls, floors)")
+            print(f"Randomizing {len(object_geoms)} object geoms (cubes/cones only)")
+            
+            # Wrapper 1: Background (Standard randomization + Camera/Lighting)
+            if background_geoms:
+                env = DomainRandomizationWrapper(
+                    env,
+                    seed=seed_to_use,
+                    randomize_color=True,
+                    randomize_camera=True,
+                    randomize_lighting=True,
+                    randomize_dynamics=False,
+                    color_randomization_args={
+                        'geom_names': background_geoms, 
+                        'randomize_local': False, 
+                        'randomize_material': True,
+                        'randomize_skybox': False
+                    },
+                    camera_randomization_args={
+                        'randomize_position': True, 
+                        'randomize_rotation': True, 
+                        'randomize_fovy': True
+                    },
+                    lighting_randomization_args={
+                        'randomize_position': True, 
+                        'randomize_direction': True, 
+                        'randomize_specular': True, 
+                        'randomize_ambient': True, 
+                        'randomize_diffuse': True
+                    },
+                    randomize_on_reset=True,
+                    randomize_every_n_steps=0
+                )
+                
+            # Wrapper 2: Objects (Explicit RGB randomization only)
+            # REMOVED: We will do this manually after reset to ensure it works
+            # if object_geoms:
+            #    env = DomainRandomizationWrapper(...)
+
+
+        # Setup data collector if recording is requested
+        data_collector = None
+        if record_dir:
+            data_collector = HDF5DataCollectionWrapper(env, record_dir)
+            data_collector.set_randomization_info(use_randomization, seed_to_use)
 
         # Reset environment first
         # Temporarily set deterministic_reset to True to prevent random object placement
@@ -406,6 +557,45 @@ def playback_trajectory(env, hdf5_file, max_fr=None):
         env.deterministic_reset = True
         env.reset()
         env.deterministic_reset = original_deterministic_reset
+        
+        # MANUAL OBJECT RANDOMIZATION
+        if use_randomization and object_geoms:
+            print(f"Applying MANUAL explicit color randomization to {len(object_geoms)} objects...")
+            rng = np.random.RandomState(seed_to_use)
+            
+            for name in object_geoms:
+                # Generate random color
+                rgb = rng.uniform(0, 1, size=3)
+                rgba = np.append(rgb, 1.0)
+                
+                # Set geom color
+                geom_id = env.sim.model.geom_name2id(name)
+                env.sim.model.geom_rgba[geom_id] = rgba
+                
+                # Handle material if present
+                mat_id = env.sim.model.geom_matid[geom_id]
+                if mat_id >= 0:
+                    # Set material color
+                    env.sim.model.mat_rgba[mat_id] = rgba
+                    
+                    # Remove texture association to force solid color
+                    # Note: mat_texid is an array. For some versions it's 1D, others 2D (texture roles)
+                    # We'll try to set it safely
+                    try:
+                        if hasattr(env.sim.model.mat_texid, 'ndim') and env.sim.model.mat_texid.ndim > 1:
+                             env.sim.model.mat_texid[mat_id, :] = -1
+                        else:
+                             env.sim.model.mat_texid[mat_id] = -1
+                    except Exception as e:
+                        print(f"Warning: Could not remove texture for {name}: {e}")
+                        
+            # Propagate changes to renderer
+            env.sim.forward()
+            print("✓ Manual object randomization applied")
+        
+        # Start episode recording if enabled
+        if data_collector:
+            data_collector.start_episode()
         
         # Now load and restore ALL initial state data
         state_restored = False
@@ -503,15 +693,44 @@ def playback_trajectory(env, hdf5_file, max_fr=None):
             obs, _, _, _ = env.step(zero_action)
             print("✓ Observables updated after state restoration")
 
+        # Load original robot states for drift comparison
+        original_robot_states = {}
+        if 'robot_states' in f:
+            for key in f['robot_states']:
+                original_robot_states[key] = f['robot_states'][key][:]
+        
+        max_drift = 0.0
+        
         # Playback each step
         for i, action in enumerate(actions):
             start = time.time()
 
             obs, reward, done, info = env.step(action)
+            
+            # Calculate drift
+            current_drift = 0.0
+            for j, robot in enumerate(env.robots):
+                key = f'robot{j}_joint_pos'
+                if key in original_robot_states and i < len(original_robot_states[key]):
+                    current_qpos = robot._joint_positions
+                    original_qpos = original_robot_states[key][i]
+                    drift = np.max(np.abs(current_qpos - original_qpos))
+                    current_drift = max(current_drift, drift)
+            
+            max_drift = max(max_drift, current_drift)
+            
+            # Check for task success (same as in collection)
+            success = env.unwrapped._check_success()
+            info['success'] = success
+            
+            # Record step if enabled
+            if data_collector:
+                data_collector.record_step(obs, action, reward, done, info)
+                
             env.render()
 
             if i % 50 == 0:
-                print(f"Playback step {i} | Reward: {reward:.3f} | Done: {done}")
+                print(f"Playback step {i} | Reward: {reward:.3f} | Done: {done} | Drift: {current_drift:.4f}")
 
             # Limit frame rate if necessary
             if max_fr is not None:
@@ -523,6 +742,13 @@ def playback_trajectory(env, hdf5_file, max_fr=None):
             if dones[i]:
                 print(f"Playback completed at step {i}")
                 break
+        
+        print(f"Max drift during playback: {max_drift:.4f}")
+                
+        # Save recorded episode if enabled
+        if data_collector:
+            data_collector.save_episode()
+            print(f"Saved augmented playback to {record_dir}")
 
     env.close()
 
@@ -575,6 +801,23 @@ if __name__ == "__main__":
         default=None,
         help="Path to HDF5 file to playback instead of collecting new data",
     )
+    parser.add_argument(
+        "--randomize",
+        action="store_true",
+        help="Apply domain randomization (visuals, lighting, camera)",
+    )
+    parser.add_argument(
+        "--randomize-seed",
+        type=int,
+        default=None,
+        help="Seed for domain randomization",
+    )
+    parser.add_argument(
+        "--record-playback-dir",
+        type=str,
+        default=None,
+        help="Directory to record playback to (useful for data augmentation)",
+    )
 
     args = parser.parse_args()
 
@@ -602,7 +845,7 @@ if __name__ == "__main__":
         ignore_done=False,
         reward_shaping=True,
         control_freq=20,
-        render_camera="robot0_eye_in_hand",  # Default to wrist camera
+        render_camera="agentview",  # Default to wrist camera
     )
 
     # Wrap this environment in a visualization wrapper
@@ -618,7 +861,14 @@ if __name__ == "__main__":
     if args.playback:
         # Playback mode
         print("Starting playback mode...")
-        playback_trajectory(env, args.playback, args.max_fr)
+        playback_trajectory(
+            env, 
+            args.playback, 
+            args.max_fr,
+            randomize=args.randomize,
+            randomize_seed=args.randomize_seed,
+            record_dir=args.record_playback_dir
+        )
     else:
         # Teleoperation mode
         print("=" * 80)
@@ -671,7 +921,14 @@ if __name__ == "__main__":
             raise Exception("Invalid device choice: choose 'keyboard', 'spacemouse', or 'dualsense'.")
 
         # Collect teleoperation trajectory
-        collect_teleoperation_trajectory(env, device, data_collector, args.max_fr)
+        collect_teleoperation_trajectory(
+            env, 
+            device, 
+            data_collector, 
+            args.max_fr,
+            randomize=args.randomize,
+            randomize_seed=args.randomize_seed
+        )
 
     env.close()
     print("\nSession complete!")

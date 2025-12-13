@@ -78,6 +78,9 @@ python robosuite/demos/demo_collect_and_playback_data.py \
 - `--pos-sensitivity`: Position control sensitivity (default: 1.0)
 - `--rot-sensitivity`: Rotation control sensitivity (default: 1.0)
 - `--max_fr`: Frame rate limit in fps (default: 20)
+- `--randomize`: Enable domain randomization (textures, lighting, cameras)
+- `--randomize-seed`: Specific seed for randomization reproducibility
+- `--record-playback-dir`: Directory to save augmented playback data
 
 ### 3. Perform the Task
 
@@ -117,6 +120,42 @@ This will replay the recorded actions and show the robot performing the task.
 - This ensures perfect reproduction of the initial configuration, with the robot arm and objects starting in exactly the same position as during recording
 - Observables are automatically updated after state restoration to ensure visual rendering matches the restored state
 
+#### Domain Randomization Features
+
+The system now supports visual domain randomization for enhanced data collection and augmentation:
+
+**Collect Data with Randomization:**
+```bash
+python robosuite/demos/demo_collect_and_playback_data.py \
+    --randomize \
+    --directory /tmp/randomized_demos
+```
+
+**Data Augmentation (Create Variations):**
+Take an existing demo and replay it with new random visuals, saving the result:
+```bash
+python robosuite/demos/demo_collect_and_playback_data.py \
+    --playback /path/to/original_demo.h5 \
+    --randomize \
+    --record-playback-dir /tmp/augmented_dataset
+```
+
+**Randomization Parameters:**
+- `--randomize`: Enable domain randomization
+- `--randomize-seed`: Specific seed for reproducible randomization (optional)
+- `--record-playback-dir`: Directory to save augmented playback data
+
+**What Gets Randomized:**
+- **Object Textures**: Colors and patterns on cubes, tables, walls, floors
+- **Lighting**: Position, direction, and intensity of light sources
+- **Cameras**: Position, orientation, and field-of-view within reasonable limits
+- **Robot Exclusion**: Robot appearance remains consistent (as requested)
+
+**Reproducibility:**
+- When recording with randomization, the seed is saved in the HDF5 file
+- Playback automatically detects and reproduces the exact same randomization
+- This ensures 1:1 visual reproduction between recording and playback
+
 ## Data Format
 
 Each demonstration is saved as an HDF5 file containing:
@@ -129,6 +168,8 @@ Each demonstration is saved as an HDF5 file containing:
 - `start_time`: Unix timestamp when episode started
 - `duration`: Total duration in seconds
 - `success`: Whether the episode was completed successfully
+- `randomization_enabled`: Whether domain randomization was used
+- `randomization_seed`: Seed used for randomization (if enabled)
 
 ### Initial State Data (for perfect replay)
 
@@ -304,6 +345,51 @@ python robosuite/demos/demo_collect_and_playback_data.py \
     --pos-sensitivity 2.0 \
     --rot-sensitivity 1.5
 ```
+
+### Domain Randomization
+
+#### Recording with Randomization
+
+Create demonstrations with randomized visuals for robust policy training:
+
+```bash
+python robosuite/demos/demo_collect_and_playback_data.py \
+    --randomize \
+    --directory /tmp/randomized_demos
+```
+
+#### Data Augmentation
+
+Generate multiple variations of existing demonstrations:
+
+```bash
+# Create 5 different visual variations of the same demo
+for i in {1..5}; do
+    python robosuite/demos/demo_collect_and_playback_data.py \
+        --playback /path/to/original_demo.h5 \
+        --randomize \
+        --randomize-seed $i \
+        --record-playback-dir /tmp/augmented_dataset_$i
+done
+```
+
+#### Reproducible Randomization
+
+Use specific seeds for consistent randomization across sessions:
+
+```bash
+python robosuite/demos/demo_collect_and_playback_data.py \
+    --randomize \
+    --randomize-seed 42 \
+    --directory /tmp/reproducible_demos
+```
+
+**Randomization Features:**
+- **Textures**: Object colors, patterns, and materials
+- **Lighting**: Light positions, directions, and intensities  
+- **Cameras**: Camera positions, orientations, and FOV
+- **Robot Consistency**: Robot appearance remains unchanged
+- **Automatic Reproduction**: Playback automatically uses saved randomization settings
 
 ## Next Steps
 
