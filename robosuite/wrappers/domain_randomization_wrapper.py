@@ -157,10 +157,10 @@ class DomainRandomizationWrapper(Wrapper):
 
         if self.randomize_color:
             rs_assert(
-                mujoco.__version__ == "3.1.1",
+                mujoco.__version__ in ["3.1.1", "3.4.0"],
                 (
-                    "TextureModder requires mujoco version 3.1.1 to run. "
-                    "Pending support for later versions. Alternatively, you can set randomize_color=False."
+                    "TextureModder requires mujoco version 3.1.1 or 3.4.0 to run. "
+                    f"Current version: {mujoco.__version__}. Alternatively, you can set randomize_color=False."
                 ),
             )
             self.tex_modder = TextureModder(

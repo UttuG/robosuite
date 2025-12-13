@@ -1,8 +1,27 @@
 """
-Record trajectory data with the DataCollectionWrapper wrapper and play them back.
+Teleoperate robot with keyboard and collect demonstration data in HDF5 format.
 
-Example:
-    $ python demo_collect_and_playback_data.py --environment Lift
+This script integrates keyboard teleoperation with data collection for the MultiTableAssembly environment.
+During teleoperation, it records:
+- RGB images from integrated cameras (agentview and robot0_eye_in_hand)
+- Robot joint states and gripper status
+- Relative poses and sensor readings (all observables from Stage 2)
+- Control commands/actions applied during teleoperation
+
+Data is stored in HDF5 format for efficient storage and later playback.
+
+Keyboard Controls:
+    Keys        Command
+    Ctrl+q      reset simulation
+    spacebar    toggle gripper (open/close)
+    up-right-down-left    move horizontally in x-y plane
+    . ;         move vertically
+    o p         rotate (yaw)
+    y h         rotate (pitch)
+    e r         rotate (roll)
+    b           toggle arm/base mode (if applicable)
+    s           switch active arm (if multi-armed robot)
+    =           switch active robot (if multi-robot environment)
 """
 
 import argparse
@@ -10,34 +29,329 @@ import os
 import time
 from glob import glob
 
+import h5py
 import numpy as np
 
 import robosuite as suite
-from robosuite.wrappers import DataCollectionWrapper
+from robosuite import load_composite_controller_config
+from robosuite.controllers.composite.composite_controller import WholeBody
+from robosuite.wrappers import VisualizationWrapper
 
 
-def collect_random_trajectory(env, timesteps=1000, max_fr=None):
-    """Run a random policy to collect trajectories.
+class HDF5DataCollectionWrapper:
+    """
+    HDF5-based data collection wrapper for recording teleoperation demonstrations.
+    """
 
-    The rollout trajectory is saved to files in npz format.
-    Modify the DataCollectionWrapper wrapper to add new fields or change data formats.
+    def __init__(self, env, directory, collect_freq=1, flush_freq=100):
+        """
+        Initializes the HDF5 data collection wrapper.
+
+        Args:
+            env (MujocoEnv): The environment to monitor.
+            directory (str): Where to store collected data.
+            collect_freq (int): How often to save simulation state, in terms of environment steps.
+            flush_freq (int): How frequently to dump data to disk, in terms of environment steps.
+        """
+        self.env = env
+        self.directory = directory
+        self.collect_freq = collect_freq
+        self.flush_freq = flush_freq
+
+        # Create directory if it doesn't exist
+        if not os.path.exists(directory):
+            print(f"HDF5DataCollectionWrapper: making new directory at {directory}")
+            os.makedirs(directory)
+
+        # Episode tracking
+        self.episode_count = 0
+        self.current_episode_data = None
+        self.episode_start_time = None
+        self.episode_success = False
+        self.episode_success = False
+
+        # Current episode data buffers
+        self.reset_episode_data()
+
+    def reset_episode_data(self):
+        """Reset data buffers for new episode."""
+        self.current_episode_data = {
+            'actions': [],
+            'rewards': [],
+            'dones': [],
+            'timestamps': [],
+            'camera_images': {},
+            'robot_states': [],
+            'gripper_states': [],
+            'observables': []
+        }
+
+        # Initialize camera image buffers
+        camera_names = getattr(self.env.unwrapped if hasattr(self.env, 'unwrapped') else self.env, 'camera_names', [])
+        if camera_names:
+            for cam_name in camera_names:
+                self.current_episode_data['camera_images'][cam_name] = []
+
+    def start_episode(self):
+        """Start a new episode."""
+        self.episode_start_time = time.time()
+        self.reset_episode_data()
+        self.episode_success = False
+
+        # Save EVERYTHING for complete state restoration
+        # This includes model XML, full state, and all joint positions
+        self._current_task_instance_xml = self.env.sim.model.get_xml()
+        self._current_task_instance_state = np.array(self.env.sim.get_state().flatten())
+        
+        # Save all joint positions and velocities for all objects and robots
+        self._all_joint_data = {
+            'qpos': np.array(self.env.sim.data.qpos),  # All joint positions
+            'qvel': np.array(self.env.sim.data.qvel),  # All joint velocities
+            'body_pos': np.array(self.env.sim.data.body_xpos),  # All body positions
+            'body_rot': np.array(self.env.sim.data.body_xmat),  # All body rotations
+        }
+        
+        # Save specific object joint positions for explicit restoration
+        self._cubeA_qpos = self.env.sim.data.get_joint_qpos('cubeA_joint0').copy()
+        self._cubeB_qpos = self.env.sim.data.get_joint_qpos('cubeB_joint0').copy()
+        
+        # Save robot joint positions for explicit restoration
+        self._robot_qpos = {}
+        for i, robot in enumerate(self.env.robots):
+            self._robot_qpos[f'robot{i}_joint_pos'] = robot._joint_positions.copy()
+        
+        self.episode_count += 1
+        self.episode_success = False
+
+    def record_step(self, observation, action, reward, done, info):
+        """Record a single step of data."""
+        timestamp = time.time() - self.episode_start_time
+
+        # Update success status if achieved
+        if info.get('success', False):
+            self.episode_success = True
+
+        # Record basic step data
+        self.current_episode_data['actions'].append(action)
+        self.current_episode_data['rewards'].append(reward)
+        self.current_episode_data['dones'].append(done)
+        self.current_episode_data['timestamps'].append(timestamp)
+
+        # Record camera images if available
+        camera_names = getattr(self.env, 'camera_names', [])
+        if camera_names:
+            for cam_name in camera_names:
+                image_key = f"{cam_name}_image"
+                if image_key in observation:
+                    self.current_episode_data['camera_images'][cam_name].append(
+                        observation[image_key].copy()
+                    )
+
+        # Record robot joint states
+        robot_state = {}
+        for i, robot in enumerate(self.env.robots):
+            robot_state[f'robot{i}_joint_pos'] = robot._joint_positions.copy()
+            robot_state[f'robot{i}_joint_vel'] = robot._joint_velocities.copy()
+        self.current_episode_data['robot_states'].append(robot_state)
+
+        # Record gripper states using proper accessor methods
+        gripper_state = {}
+        for i, robot in enumerate(self.env.robots):
+            for arm in robot.arms:
+                if robot.has_gripper[arm]:
+                    # Access gripper joint positions from simulation
+                    gripper_qpos = np.array([self.env.sim.data.qpos[x] for x in robot._ref_gripper_joint_pos_indexes[arm]])
+                    gripper_qvel = np.array([self.env.sim.data.qvel[x] for x in robot._ref_gripper_joint_vel_indexes[arm]])
+                    gripper_state[f'robot{i}_{arm}_gripper_qpos'] = gripper_qpos.copy()
+                    gripper_state[f'robot{i}_{arm}_gripper_qvel'] = gripper_qvel.copy()
+                    gripper_state[f'robot{i}_{arm}_gripper_action'] = robot.gripper[arm].current_action.copy()
+        self.current_episode_data['gripper_states'].append(gripper_state)
+
+        # Record all observables (including our custom ones)
+        obs_data = {}
+        for key, value in observation.items():
+            if not key.endswith('_image'):  # Skip image data as it's handled separately
+                if isinstance(value, np.ndarray):
+                    obs_data[key] = value.copy()
+                else:
+                    obs_data[key] = value
+        self.current_episode_data['observables'].append(obs_data)
+
+    def save_episode(self):
+        """Save current episode data to HDF5 file."""
+        if not self.current_episode_data['actions']:
+            return  # No data to save
+
+        # Create filename with timestamp
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        filename = f"demo_episode_{self.episode_count:04d}_{timestamp}.h5"
+        filepath = os.path.join(self.directory, filename)
+
+        print(f"Saving episode {self.episode_count} to {filepath}")
+
+        env = self.env.unwrapped if hasattr(self.env, 'unwrapped') else self.env
+
+        with h5py.File(filepath, 'w') as f:
+            # Save metadata
+            f.attrs['episode_number'] = self.episode_count
+            f.attrs['environment'] = self.env.__class__.__name__
+            f.attrs['robots'] = str([robot.name for robot in self.env.robots])
+            f.attrs['total_steps'] = len(self.current_episode_data['actions'])
+            f.attrs['start_time'] = self.episode_start_time
+            f.attrs['duration'] = time.time() - self.episode_start_time
+            f.attrs['success'] = self.episode_success
+
+            # Save model XML and initial state for playback
+            f.create_dataset('model_xml', data=self._current_task_instance_xml, dtype=h5py.string_dtype())
+            f.create_dataset('initial_state', data=self._current_task_instance_state)
+            
+            # Save ALL joint data comprehensively
+            initial_state_group = f.create_group('initial_state_data')
+            initial_state_group.create_dataset('qpos', data=self._all_joint_data['qpos'])
+            initial_state_group.create_dataset('qvel', data=self._all_joint_data['qvel'])
+            initial_state_group.create_dataset('body_pos', data=self._all_joint_data['body_pos'])
+            initial_state_group.create_dataset('body_rot', data=self._all_joint_data['body_rot'])
+            
+            # Save object joint positions explicitly for fallback
+            f.create_dataset('cubeA_joint_qpos', data=self._cubeA_qpos)
+            f.create_dataset('cubeB_joint_qpos', data=self._cubeB_qpos)
+            
+            # Save robot joint positions explicitly for fallback
+            for key, value in self._robot_qpos.items():
+                f.create_dataset(key, data=value)
+
+            # Save basic trajectory data
+            f.create_dataset('actions', data=np.array(self.current_episode_data['actions']))
+            f.create_dataset('rewards', data=np.array(self.current_episode_data['rewards']))
+            f.create_dataset('dones', data=np.array(self.current_episode_data['dones']))
+            f.create_dataset('timestamps', data=np.array(self.current_episode_data['timestamps']))
+
+            # Save camera images
+            if self.current_episode_data['camera_images']:
+                cam_group = f.create_group('camera_images')
+                for cam_name, images in self.current_episode_data['camera_images'].items():
+                    if images:  # Only save if we have images
+                        cam_group.create_dataset(cam_name, data=np.array(images))
+
+            # Save robot states
+            robot_group = f.create_group('robot_states')
+            if self.current_episode_data['robot_states']:
+                # Save keys as metadata
+                robot_group.attrs['keys'] = list(self.current_episode_data['robot_states'][0].keys())
+                # Create dataset for each key
+                for key in robot_group.attrs['keys']:
+                    data = [step[key] for step in self.current_episode_data['robot_states']]
+                    robot_group.create_dataset(key, data=np.array(data))
+
+            # Save gripper states
+            gripper_group = f.create_group('gripper_states')
+            if self.current_episode_data['gripper_states']:
+                gripper_group.attrs['keys'] = list(self.current_episode_data['gripper_states'][0].keys())
+                for key in gripper_group.attrs['keys']:
+                    data = [step[key] for step in self.current_episode_data['gripper_states']]
+                    gripper_group.create_dataset(key, data=np.array(data))
+
+            # Save observables
+            obs_group = f.create_group('observables')
+            if self.current_episode_data['observables']:
+                obs_group.attrs['keys'] = list(self.current_episode_data['observables'][0].keys())
+                for key in obs_group.attrs['keys']:
+                    data = [step[key] for step in self.current_episode_data['observables']]
+                    obs_group.create_dataset(key, data=np.array(data))
+
+        success_marker = "✓ SUCCESS" if self.episode_success else "✗ INCOMPLETE"
+        print(f"Episode {self.episode_count} saved with {len(self.current_episode_data['actions'])} steps [{success_marker}]")
+
+
+def collect_teleoperation_trajectory(env, device, data_collector, max_fr=None):
+    """Collect trajectory data through keyboard teleoperation.
 
     Args:
         env (MujocoEnv): environment instance to collect trajectories from
-        timesteps(int): how many environment timesteps to run for a given trajectory
+        device: keyboard/spacemouse device for teleoperation
+        data_collector: HDF5DataCollectionWrapper instance
         max_fr (int): if specified, pause the simulation whenever simulation runs faster than max_fr
     """
 
-    env.reset()
-    dof = env.action_dim
+    # Reset the environment
+    obs = env.reset()
 
-    for t in range(timesteps):
+    # Start new episode (capture state AFTER reset to ensure we get the actual initial state)
+    data_collector.start_episode()
+
+    # Setup rendering
+    env.render()
+
+    # Initialize variables that should be maintained between resets
+    last_grasp = 0
+
+    # Initialize device control
+    device.start_control()
+    all_prev_gripper_actions = [
+        {
+            f"{robot_arm}_gripper": np.repeat([0], robot.gripper[robot_arm].dof)
+            for robot_arm in robot.arms
+            if robot.gripper[robot_arm].dof > 0
+        }
+        for robot in env.robots
+    ]
+
+    step_count = 0
+
+    # Loop until we get a reset from the input or the task completes
+    while True:
         start = time.time()
-        action = np.random.randn(dof)
-        env.step(action)
+
+        # Set active robot
+        active_robot = env.robots[device.active_robot]
+
+        # Get the newest action
+        input_ac_dict = device.input2action()
+
+        # If action is none, then this a reset so we should break
+        if input_ac_dict is None:
+            break
+
+        from copy import deepcopy
+
+        action_dict = deepcopy(input_ac_dict)  # {}
+        # set arm actions
+        for arm in active_robot.arms:
+            if isinstance(active_robot.composite_controller, WholeBody):  # input type passed to joint_action_policy
+                controller_input_type = active_robot.composite_controller.joint_action_policy.input_type
+            else:
+                controller_input_type = active_robot.part_controllers[arm].input_type
+
+            if controller_input_type == "delta":
+                action_dict[arm] = input_ac_dict[f"{arm}_delta"]
+            elif controller_input_type == "absolute":
+                action_dict[arm] = input_ac_dict[f"{arm}_abs"]
+            else:
+                raise ValueError
+
+        # Maintain gripper state for each robot but only update the active robot with action
+        env_action = [robot.create_action_vector(all_prev_gripper_actions[i]) for i, robot in enumerate(env.robots)]
+        env_action[device.active_robot] = active_robot.create_action_vector(action_dict)
+        env_action = np.concatenate(env_action)
+        for gripper_ac in all_prev_gripper_actions[device.active_robot]:
+            all_prev_gripper_actions[device.active_robot][gripper_ac] = action_dict[gripper_ac]
+
+        # Step environment
+        obs, reward, done, info = env.step(env_action)
+
+        # Check for task success
+        success = env.unwrapped._check_success()
+        info['success'] = success
+
+        # Record the step
+        data_collector.record_step(obs, env_action, reward, done, info)
+
         env.render()
-        if t % 100 == 0:
-            print(t)
+        step_count += 1
+
+        # Print status every 50 steps
+        if step_count % 50 == 0:
+            print(f"Step {step_count} | Reward: {reward:.3f} | Done: {done} | Success: {success}")
 
         # limit frame rate if necessary
         if max_fr is not None:
@@ -46,87 +360,318 @@ def collect_random_trajectory(env, timesteps=1000, max_fr=None):
             if diff > 0:
                 time.sleep(diff)
 
+        # Check if episode is done
+        if done:
+            print(f"\nHorizon reached at step {step_count}!")
+            if success:
+                print("✓ Task completed successfully!")
+            break
+        
+        if success:
+            print(f"\n✓ Task completed successfully at step {step_count}!")
+            print("Episode will be marked as successful. Continue or press Ctrl+q to finish...")
+            data_collector.episode_success = True
 
-def playback_trajectory(env, ep_dir, max_fr=None):
-    """Playback data from an episode.
+    # Save the episode data
+    data_collector.save_episode()
+    print(f"Episode completed with {step_count} steps")
+
+
+def playback_trajectory(env, hdf5_file, max_fr=None):
+    """Playback data from an HDF5 episode file with complete state restoration.
 
     Args:
         env (MujocoEnv): environment instance to playback trajectory in
-        ep_dir (str): The path to the directory containing data for an episode.
+        hdf5_file (str): Path to the HDF5 file containing episode data
+        max_fr (int): if specified, pause the simulation whenever simulation runs faster than max_fr
     """
 
-    # first reload the model from the xml
-    xml_path = os.path.join(ep_dir, "model.xml")
-    with open(xml_path, "r") as f:
-        env.reset_from_xml_string(f.read())
+    print(f"Loading episode from {hdf5_file}")
 
-    state_paths = os.path.join(ep_dir, "state_*.npz")
+    with h5py.File(hdf5_file, 'r') as f:
+        actions = f['actions'][:]
+        rewards = f['rewards'][:]
+        dones = f['dones'][:]
+        timestamps = f['timestamps'][:]
 
-    # read states back, load them one by one, and render
-    t = 0
-    for state_file in sorted(glob(state_paths)):
-        print(state_file)
-        dic = np.load(state_file)
-        states = dic["states"]
-        for state in states:
+        print(f"Episode has {len(actions)} steps")
+        print(f"Duration: {f.attrs.get('duration', 'N/A'):.2f} seconds")
+        print(f"Environment: {f.attrs.get('environment', 'N/A')}")
+        print(f"Robots: {f.attrs.get('robots', 'N/A')}")
+        print(f"Success: {f.attrs.get('success', 'N/A')}")
+
+        # Reset environment first
+        # Temporarily set deterministic_reset to True to prevent random object placement
+        original_deterministic_reset = env.deterministic_reset
+        env.deterministic_reset = True
+        env.reset()
+        env.deterministic_reset = original_deterministic_reset
+        
+        # Now load and restore ALL initial state data
+        state_restored = False
+        
+        # Strategy 0: Try complete Mujoco state restoration first (most reliable)
+        if 'initial_state' in f:
+            try:
+                print("✓ Attempting complete state restoration (Strategy 0)...")
+                initial_state = f['initial_state'][:]
+                env.sim.set_state_from_flattened(initial_state)
+                env.sim.forward()
+                print("✓ Successfully restored complete Mujoco state")
+                state_restored = True
+            except Exception as e:
+                print(f"⚠ Complete state restoration failed: {e}")
+                state_restored = False
+        
+        # Strategy 1: Try to use comprehensive joint data if available
+        if not state_restored and 'initial_state_data' in f:
+            try:
+                print("✓ Attempting comprehensive state restoration (Strategy 1)...")
+                initial_state_data = f['initial_state_data']
+                
+                qpos = initial_state_data['qpos'][:]
+                qvel = initial_state_data['qvel'][:]
+                
+                # Set all joint positions and velocities
+                env.sim.data.qpos[:] = qpos
+                env.sim.data.qvel[:] = qvel
+                
+                # If body positions/rotations are available, set them too (though they derive from qpos)
+                env.sim.forward()
+                
+                print("✓ Successfully restored all joint positions and velocities")
+                state_restored = True
+            except Exception as e:
+                print(f"⚠ Comprehensive state restoration failed: {e}")
+                state_restored = False
+        
+        # Strategy 2: Try explicit object joint position restoration
+        if not state_restored and 'cubeA_joint_qpos' in f and 'cubeB_joint_qpos' in f:
+            try:
+                print("✓ Attempting explicit object position restoration (Strategy 2)...")
+                cubeA_joint_qpos = f['cubeA_joint_qpos'][:]
+                cubeB_joint_qpos = f['cubeB_joint_qpos'][:]
+                robot_qpos = {}
+                
+                for i, robot in enumerate(env.robots):
+                    key = f'robot{i}_joint_pos'
+                    if key in f:
+                        robot_qpos[key] = f[key][:]
+                
+                # Restore object positions
+                env.sim.data.set_joint_qpos('cubeA_joint0', cubeA_joint_qpos)
+                env.sim.data.set_joint_qpos('cubeB_joint0', cubeB_joint_qpos)
+                
+                # Restore robot positions
+                for i, robot in enumerate(env.robots):
+                    key = f'robot{i}_joint_pos'
+                    if key in robot_qpos:
+                        try:
+                            robot.set_robot_joint_positions(robot_qpos[key])
+                        except:
+                            # Fallback: set directly in simulation
+                            for j, qpos_val in enumerate(robot_qpos[key]):
+                                env.sim.data.qpos[robot._ref_joint_pos_indexes[j]] = qpos_val
+                
+                env.sim.forward()
+                print("✓ Successfully restored object and robot positions (explicit method)")
+                state_restored = True
+            except Exception as e:
+                print(f"⚠ Explicit position restoration failed: {e}")
+                state_restored = False
+        
+        # Strategy 3: Try using saved initial_state via set_state_from_flattened (fallback)
+        if not state_restored and 'initial_state' in f:
+            try:
+                print("✓ Attempting standard state restoration (Strategy 3)...")
+                initial_state = f['initial_state'][:]
+                env.sim.set_state_from_flattened(initial_state)
+                env.sim.forward()
+                print("✓ Successfully restored state via set_state_from_flattened()")
+                state_restored = True
+            except Exception as e:
+                print(f"⚠ Standard state restoration failed: {e}")
+                state_restored = False
+        
+        if not state_restored:
+            print("⚠ Could not restore initial state - using current randomized state")
+            print("  Object and robot positions may not match the recorded episode")
+
+        # Update observables after state restoration by taking a zero-action step
+        if state_restored:
+            zero_action = np.zeros(env.action_dim)
+            obs, _, _, _ = env.step(zero_action)
+            print("✓ Observables updated after state restoration")
+
+        # Playback each step
+        for i, action in enumerate(actions):
             start = time.time()
-            env.sim.set_state_from_flattened(state)
-            env.sim.forward()
-            env.viewer.update()
-            env.render()
-            t += 1
-            if t % 100 == 0:
-                print(t)
 
+            obs, reward, done, info = env.step(action)
+            env.render()
+
+            if i % 50 == 0:
+                print(f"Playback step {i} | Reward: {reward:.3f} | Done: {done}")
+
+            # Limit frame rate if necessary
             if max_fr is not None:
                 elapsed = time.time() - start
                 diff = 1 / max_fr - elapsed
                 if diff > 0:
                     time.sleep(diff)
+
+            if dones[i]:
+                print(f"Playback completed at step {i}")
+                break
+
     env.close()
 
 
-if __name__ == "__main__":
 
+if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--environment", type=str, default="Door")
-    parser.add_argument("--robots", nargs="+", type=str, default="Panda", help="Which robot(s) to use in the env")
-    parser.add_argument("--directory", type=str, default="/tmp/")
-    parser.add_argument("--timesteps", type=int, default=1000)
+    parser.add_argument("--environment", type=str, default="MultiTableAssembly")
+    parser.add_argument(
+        "--robots",
+        nargs="+",
+        type=str,
+        default="Panda",
+        help="Which robot(s) to use in the env",
+    )
+    parser.add_argument("--directory", type=str, default="/tmp/teleop_demos/")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="keyboard",
+        help="Device to use for teleoperation (keyboard, spacemouse, dualsense)",
+    )
+    parser.add_argument(
+        "--controller",
+        type=str,
+        default=None,
+        help="Choice of controller. Can be generic (eg. 'BASIC' or 'WHOLE_BODY_MINK_IK') or json file",
+    )
+    parser.add_argument(
+        "--pos-sensitivity",
+        type=float,
+        default=1.0,
+        help="How much to scale position user inputs",
+    )
+    parser.add_argument(
+        "--rot-sensitivity",
+        type=float,
+        default=1.0,
+        help="How much to scale rotation user inputs",
+    )
     parser.add_argument(
         "--max_fr",
         default=20,
         type=int,
-        help="Sleep when simluation runs faster than specified frame rate; 20 fps is real time.",
+        help="Sleep when simulation runs faster than specified frame rate; 20 fps is real time.",
     )
+    parser.add_argument(
+        "--playback",
+        type=str,
+        default=None,
+        help="Path to HDF5 file to playback instead of collecting new data",
+    )
+
     args = parser.parse_args()
 
-    # create original environment
+    # Get controller config
+    controller_config = load_composite_controller_config(
+        controller=args.controller,
+        robot=args.robots[0],
+    )
+
+    # Create environment
     env = suite.make(
         args.environment,
         robots=args.robots,
-        ignore_done=True,
-        use_camera_obs=False,
+        controller_configs=controller_config,
         has_renderer=True,
-        has_offscreen_renderer=False,
+        has_offscreen_renderer=True,
+        use_camera_obs=True,  # Enable camera observations
+        use_object_obs=True,  # Enable object state observations
+        camera_names=[
+            "agentview",           # Main view
+            "robot0_eye_in_hand",  # Wrist camera (eye-in-hand)
+        ],
+        camera_heights=256,
+        camera_widths=256,
+        ignore_done=False,
+        reward_shaping=True,
         control_freq=20,
+        render_camera="robot0_eye_in_hand",  # Default to wrist camera
     )
+
+    # Wrap this environment in a visualization wrapper
+    env = VisualizationWrapper(env, indicator_configs=None)
+
+    # Setup printing options for numbers
+    np.set_printoptions(formatter={"float": lambda x: "{0:0.3f}".format(x)})
+
+    # Initialize HDF5 data collector
     data_directory = args.directory
+    data_collector = HDF5DataCollectionWrapper(env, data_directory)
 
-    # wrap the environment with data collection wrapper
-    env = DataCollectionWrapper(env, data_directory)
+    if args.playback:
+        # Playback mode
+        print("Starting playback mode...")
+        playback_trajectory(env, args.playback, args.max_fr)
+    else:
+        # Teleoperation mode
+        print("=" * 80)
+        print("TELEOPERATION DATA COLLECTION")
+        print("=" * 80)
+        print(f"Environment: {args.environment}")
+        print(f"Robot: {args.robots}")
+        print(f"Device: {args.device}")
+        print(f"Data directory: {data_directory}")
+        print()
+        print("Keyboard Controls:")
+        print("  Ctrl+q: reset simulation")
+        print("  spacebar: toggle gripper")
+        print("  arrow keys: move horizontally")
+        print("  . ; : move vertically")
+        print("  o p: rotate (yaw)")
+        print("  y h: rotate (pitch)")
+        print("  e r: rotate (roll)")
+        print()
+        print("Starting teleoperation... Use Ctrl+q to finish episode")
+        print("=" * 80)
 
-    # testing to make sure multiple env.reset calls don't create multiple directories
-    env.reset()
-    env.reset()
-    env.reset()
+        # initialize device
+        if args.device == "keyboard":
+            from robosuite.devices import Keyboard
 
-    # collect some data
-    print("Collecting some random data...")
-    collect_random_trajectory(env, timesteps=args.timesteps, max_fr=args.max_fr)
+            device = Keyboard(
+                env=env,
+                pos_sensitivity=args.pos_sensitivity,
+                rot_sensitivity=args.rot_sensitivity,
+            )
+            env.viewer.add_keypress_callback(device.on_press)
+        elif args.device == "spacemouse":
+            from robosuite.devices import SpaceMouse
 
-    # playback some data
-    _ = input("Press any key to begin the playback...")
-    print("Playing back the data...")
-    data_directory = env.ep_directory
-    playback_trajectory(env, data_directory, args.max_fr)
+            device = SpaceMouse(
+                env=env,
+                pos_sensitivity=args.pos_sensitivity,
+                rot_sensitivity=args.rot_sensitivity,
+            )
+        elif args.device == "dualsense":
+            from robosuite.devices import DualSense
+
+            device = DualSense(
+                env=env,
+                pos_sensitivity=args.pos_sensitivity,
+                rot_sensitivity=args.rot_sensitivity,
+            )
+        else:
+            raise Exception("Invalid device choice: choose 'keyboard', 'spacemouse', or 'dualsense'.")
+
+        # Collect teleoperation trajectory
+        collect_teleoperation_trajectory(env, device, data_collector, args.max_fr)
+
+    env.close()
+    print("\nSession complete!")

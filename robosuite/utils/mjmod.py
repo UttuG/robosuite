@@ -1271,6 +1271,10 @@ class TextureModder(BaseModder):
         if mat_id < 0:
             return False
         tex_id = self.model.mat_texid[mat_id]
+        # Patch for MuJoCo 3.4.0 compatibility
+        if hasattr(tex_id, "__len__"):
+            # Use RGB role (index 1)
+            tex_id = tex_id[1]
         if tex_id < 0:
             return False
         return True
@@ -1303,6 +1307,10 @@ class TextureModder(BaseModder):
         geom_id = self.model.geom_name2id(name)
         mat_id = self.model.geom_matid[geom_id]
         tex_id = self.model.mat_texid[mat_id]
+        # Patch for MuJoCo 3.4.0 compatibility
+        if hasattr(tex_id, "__len__"):
+            # Use RGB role (index 1)
+            tex_id = tex_id[1]
         return tex_id
 
     def _name_to_mat_id(self, name):
@@ -1387,7 +1395,11 @@ class Texture:
         self.height = model.tex_height[tex_id]
         self.width = model.tex_width[tex_id]
         self.tex_adr = model.tex_adr[tex_id]
-        self.tex_rgb = model.tex_rgb
+        # Patch for MuJoCo 3.4.0 compatibility
+        if hasattr(model, "tex_data"):
+            self.tex_rgb = model.tex_data
+        else:
+            self.tex_rgb = model.tex_rgb
 
     @property
     def bitmap(self):

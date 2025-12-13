@@ -316,10 +316,17 @@ class MultiTableAssembly(ManipulationEnv):
             r_lift += 0.5 * (1 - np.tanh(horiz_dist))
 
         # stacking is successful when the block is lifted and the gripper is not holding the object
-        # AND the cubeA is on top of cubeB
+        # AND the cubeA is on top of cubeB (checking both horizontal alignment and vertical contact)
         r_stack = 0
         if cubeA_lifted and not grasping_cubeA:
-            if np.linalg.norm(np.array(cubeA_pos[:2]) - np.array(cubeB_pos[:2])) < 0.04:
+            horiz_dist = np.linalg.norm(np.array(cubeA_pos[:2]) - np.array(cubeB_pos[:2]))
+            # Check horizontal alignment (< 4cm) and vertical proximity (cubeA should be resting on cubeB)
+            # CubeA bottom should be close to cubeB top (within ~1cm for contact)
+            cubeA_bottom = cubeA_pos[2] - 0.0375  # cubeA has 0.025 cube + 0.03 cone = ~0.0375 half-height
+            cubeB_top = cubeB_pos[2] + 0.04  # cubeB has size 0.04, so half-height is 0.04
+            vertical_contact = abs(cubeA_bottom - cubeB_top) < 0.01  # Within 1cm indicates contact/resting
+            
+            if horiz_dist < 0.04 and vertical_contact:
                 r_stack = 2.0
 
         return r_reach, r_lift, r_stack
@@ -377,17 +384,9 @@ class MultiTableAssembly(ManipulationEnv):
             mat_attrib=mat_attrib,
         )
         
-        # cubeA: item to pick from source table
-        self.cubeA = BoxObject(
+        # cubeA: item to pick from source table (cube with cone top)
+        self.cubeA = CubeConeObject(
             name="cubeA",
-            size_min=[0.03, 0.03, 0.03],
-            size_max=[0.03, 0.03, 0.03],
-            rgba=[1, 0, 0, 1],
-            material=redwood,
-        )
-        # cubeB: base object on destination table (cube base with cone top)
-        self.cubeB = CubeConeObject(
-            name="cubeB",
             cube_size=0.025,
             cone_base_radius=0.025,
             cone_tip_radius=0.015,
@@ -395,6 +394,14 @@ class MultiTableAssembly(ManipulationEnv):
             cone_ngeoms=7,
             rgba=[0, 1, 0, 1],
             material=greenwood,
+        )
+        # cubeB: base object on destination table (larger red cube)
+        self.cubeB = BoxObject(
+            name="cubeB",
+            size_min=[0.04, 0.04, 0.04],
+            size_max=[0.04, 0.04, 0.04],
+            rgba=[1, 0, 0, 1],
+            material=redwood,
         )
         cubes = [self.cubeA, self.cubeB]
         
@@ -520,10 +527,50 @@ class MultiTableAssembly(ManipulationEnv):
                     else np.zeros(3)
                 )
 
+            # Table positions for object-to-table distance calculations
+            @sensor(modality=modality)
+            def source_table_pos(obs_cache):
+                return self.table_offsets[0]
+
+            @sensor(modality=modality)
+            def dest_table_pos(obs_cache):
+                return self.table_offsets[1]
+
+            # Object-to-table distances
+            @sensor(modality=modality)
+            def cubeA_to_source_table(obs_cache):
+                return (
+                    obs_cache["cubeA_pos"] - obs_cache["source_table_pos"]
+                    if "cubeA_pos" in obs_cache and "source_table_pos" in obs_cache
+                    else np.zeros(3)
+                )
+
+            @sensor(modality=modality)
+            def cubeA_to_dest_table(obs_cache):
+                return (
+                    obs_cache["cubeA_pos"] - obs_cache["dest_table_pos"]
+                    if "cubeA_pos" in obs_cache and "dest_table_pos" in obs_cache
+                    else np.zeros(3)
+                )
+
+            @sensor(modality=modality)
+            def cubeB_to_dest_table(obs_cache):
+                return (
+                    obs_cache["cubeB_pos"] - obs_cache["dest_table_pos"]
+                    if "cubeB_pos" in obs_cache and "dest_table_pos" in obs_cache
+                    else np.zeros(3)
+                )
+
             arm_prefixes = self._get_arm_prefixes(self.robots[0], include_robot_name=False)
             full_prefixes = self._get_arm_prefixes(self.robots[0])
 
-            sensors = [cubeA_pos, cubeA_quat, cubeB_pos, cubeB_quat, cubeA_to_cubeB]
+            sensors = [
+                cubeA_pos, cubeA_quat, cubeB_pos, cubeB_quat, cubeA_to_cubeB,
+                source_table_pos, dest_table_pos,
+                cubeA_to_source_table, cubeA_to_dest_table, cubeB_to_dest_table
+            ]
+            
+            # Add gripper-to-object sensors for each arm
             sensors += [
                 self._get_obj_eef_sensor(full_pf, f"{cube}_pos", f"{arm_pf}gripper_to_{cube}", modality)
                 for arm_pf, full_pf in zip(arm_prefixes, full_prefixes)
@@ -544,12 +591,14 @@ class MultiTableAssembly(ManipulationEnv):
     def _check_success(self):
         """
         Check if cubes are stacked correctly (cubeA on cubeB).
+        Success requires cubeA to be resting on top of cubeB with proper contact.
 
         Returns:
-            bool: True if cubes are correctly stacked
+            bool: True if cubes are correctly stacked with contact
         """
         _, _, r_stack = self.staged_rewards()
-        return r_stack > 0
+        # r_stack is 2.0 only when both horizontal alignment AND vertical contact are achieved
+        return r_stack > 1.5
 
     def visualize(self, vis_settings):
         """
