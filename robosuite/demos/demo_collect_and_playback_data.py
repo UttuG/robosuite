@@ -730,7 +730,7 @@ def playback_trajectory(env, hdf5_file, max_fr=None, randomize=False, randomize_
             env.render()
 
             if i % 50 == 0:
-                print(f"Playback step {i} | Reward: {reward:.3f} | Done: {done} | Drift: {current_drift:.4f}")
+                print(f"Playback step {i} | Reward: {reward:.3f} | Done: {done} | Drift: {current_drift:.4f} | Stability Counter: {env.unwrapped.stability_counter}")
 
             # Limit frame rate if necessary
             if max_fr is not None:
@@ -738,6 +738,10 @@ def playback_trajectory(env, hdf5_file, max_fr=None, randomize=False, randomize_
                 diff = 1 / max_fr - elapsed
                 if diff > 0:
                     time.sleep(diff)
+
+            if done:
+                print(f"Playback terminated early at step {i} due to environment done (success)")
+                break
 
             if dones[i]:
                 print(f"Playback completed at step {i}")

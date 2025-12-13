@@ -198,6 +198,10 @@ class MultiTableAssembly(ManipulationEnv):
         self.reward_scale = reward_scale
         self.reward_shaping = reward_shaping
 
+        # stability counter for success detection
+        self.stability_counter = 0
+        self.stability_threshold = 100
+
         # whether to use ground-truth object states
         self.use_object_obs = use_object_obs
 
@@ -244,14 +248,15 @@ class MultiTableAssembly(ManipulationEnv):
         Un-normalized components if using reward shaping:
 
             - Reaching: in [0, 0.25], to encourage the arm to reach the item cube
-            - Grasping: in {0, 0.25}, non-zero if arm is grasping the item cube
-            - Lifting: in {0, 1}, non-zero if arm has lifted the item cube
+            - Grasping: in {0, 0.25}, non-zero if arm is grasping the item cube AND gripper is closed
+            - Empty Grasp Penalty: -0.1 if gripper closed but not grasping
+            - Lifting: in {0, 1}, non-zero if arm has lifted the item cube while grasping
             - Aligning: in [0, 0.5], encourages aligning item cube over the base cube
             - Stacking: in {0, 2}, non-zero if item cube is stacked on base cube
 
         The reward is max over the following:
 
-            - Reaching + Grasping
+            - Reaching + Grasping + Penalties
             - Lifting + Aligning
             - Stacking
 
@@ -277,6 +282,19 @@ class MultiTableAssembly(ManipulationEnv):
 
         return reward
 
+    def _post_action(self, action):
+        """
+        Do any housekeeping after taking an action.
+        Check for success and terminate episode if successful.
+        """
+        reward, done, info = super()._post_action(action)
+        
+        # Check for success and terminate episode if achieved
+        if self._check_success():
+            self.done = True
+        
+        return reward, self.done, info
+
     def staged_rewards(self):
         """
         Helper function to calculate staged rewards based on current physical states.
@@ -299,15 +317,20 @@ class MultiTableAssembly(ManipulationEnv):
         )
         r_reach = (1 - np.tanh(10.0 * dist)) * 0.25
 
-        # grasping reward
+        # grasping reward - only if gripper is closed and grasping
         grasping_cubeA = self._check_grasp(gripper=self.robots[0].gripper, object_geoms=self.cubeA)
-        if grasping_cubeA:
+        gripper_closed = self._is_gripper_closed()
+        
+        if grasping_cubeA and gripper_closed:
             r_reach += 0.25
+        elif gripper_closed and not grasping_cubeA:
+            # Penalty for closing gripper without grasping
+            r_reach -= 0.1
 
-        # lifting is successful when the cube is above the source table top by a margin
+        # lifting is successful when the cube is above the source table top by a margin AND grasping
         cubeA_height = cubeA_pos[2]
         source_table_height = self.table_offsets[0, 2]
-        cubeA_lifted = cubeA_height > source_table_height + 0.04
+        cubeA_lifted = cubeA_height > source_table_height + 0.04 and grasping_cubeA
         r_lift = 1.0 if cubeA_lifted else 0.0
 
         # Aligning is successful when cubeA is aligned with cubeB
@@ -316,20 +339,38 @@ class MultiTableAssembly(ManipulationEnv):
             r_lift += 0.5 * (1 - np.tanh(horiz_dist))
 
         # stacking is successful when the block is lifted and the gripper is not holding the object
-        # AND the cubeA is on top of cubeB (checking both horizontal alignment and vertical contact)
+        # AND the cubeA is on top of cubeB (checking vertical contact only - horizontal alignment removed)
         r_stack = 0
-        if cubeA_lifted and not grasping_cubeA:
-            horiz_dist = np.linalg.norm(np.array(cubeA_pos[:2]) - np.array(cubeB_pos[:2]))
-            # Check horizontal alignment (< 4cm) and vertical proximity (cubeA should be resting on cubeB)
+        # Check if cubeA is at the right height (on top of cubeB)
+        # cubeB is on the second table (index 1)
+        target_table_height = self.table_offsets[1, 2]
+        cubeA_at_stack_height = cubeA_height > target_table_height + 0.04
+        
+        if cubeA_at_stack_height and not grasping_cubeA:
+            # Check vertical proximity only (cubeA should be resting on cubeB)
             # CubeA bottom should be close to cubeB top (within ~1cm for contact)
             cubeA_bottom = cubeA_pos[2] - 0.0375  # cubeA has 0.025 cube + 0.03 cone = ~0.0375 half-height
             cubeB_top = cubeB_pos[2] + 0.04  # cubeB has size 0.04, so half-height is 0.04
             vertical_contact = abs(cubeA_bottom - cubeB_top) < 0.01  # Within 1cm indicates contact/resting
             
-            if horiz_dist < 0.04 and vertical_contact:
+            if vertical_contact:
                 r_stack = 2.0
 
         return r_reach, r_lift, r_stack
+
+    def _is_gripper_closed(self):
+        """
+        Check if the gripper is closed (fingers are close together).
+        
+        For Panda gripper, the joint position > 0.04 indicates closed.
+        
+        Returns:
+            bool: True if gripper is closed
+        """
+        # Get gripper joint positions
+        gripper_qpos = np.array([self.sim.data.qpos[x] for x in self.robots[0]._ref_gripper_joint_pos_indexes["right"]])
+        # For Panda, gripper joint is single joint, closed when > 0.04
+        return gripper_qpos[0] > 0.04
 
     def _load_model(self):
         """
@@ -438,6 +479,9 @@ class MultiTableAssembly(ManipulationEnv):
         Resets simulation internal configurations.
         """
         super()._reset_internal()
+
+        # Reset stability counter
+        self.stability_counter = 0
 
         # Reset all object positions using initializer sampler if we're not directly loading from an xml
         if not self.deterministic_reset:
@@ -591,14 +635,39 @@ class MultiTableAssembly(ManipulationEnv):
     def _check_success(self):
         """
         Check if cubes are stacked correctly (cubeA on cubeB).
-        Success requires cubeA to be resting on top of cubeB with proper contact.
+        Success requires cubeA to be resting on top of cubeB with proper contact
+        and stability for 100 consecutive timesteps.
 
         Returns:
-            bool: True if cubes are correctly stacked with contact
+            bool: True if cubes are correctly stacked with contact and stable
         """
-        _, _, r_stack = self.staged_rewards()
-        # r_stack is 2.0 only when both horizontal alignment AND vertical contact are achieved
-        return r_stack > 1.5
+        # Get current state
+        cubeA_pos = self.sim.data.body_xpos[self.cubeA_body_id]
+        cubeB_pos = self.sim.data.body_xpos[self.cubeB_body_id]
+        cubeA_height = cubeA_pos[2]
+        
+        # Check conditions (same as in staged_rewards for r_stack)
+        target_table_height = self.table_offsets[1, 2]
+        cubeA_at_stack_height = cubeA_height > target_table_height + 0.04
+        
+        grasping_cubeA = self._check_grasp(gripper=self.robots[0].gripper, object_geoms=self.cubeA)
+        
+        # Check vertical contact only (no horizontal alignment required)
+        cubeA_bottom = cubeA_pos[2] - 0.0375  # cubeA half-height
+        cubeB_top = cubeB_pos[2] + 0.04  # cubeB half-height
+        vertical_contact = abs(cubeA_bottom - cubeB_top) < 0.01
+        
+        # Check if all conditions are met
+        conditions_met = cubeA_at_stack_height and not grasping_cubeA and vertical_contact
+        
+        if conditions_met:
+            self.stability_counter += 1
+            if self.stability_counter >= self.stability_threshold:
+                return True
+        else:
+            self.stability_counter = 0
+            
+        return False
 
     def visualize(self, vis_settings):
         """
